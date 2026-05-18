@@ -1,0 +1,55 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: #050505;
+  --foreground: #ffffff;
+  --card: rgba(18, 18, 18, 0.7);
+  --card-border: rgba(255, 255, 255, 0.1);
+  --accent: #00d1ff;
+  --accent-glow: rgba(0, 209, 255, 0.2);
+}
+
+body {
+  color: var(--foreground);
+  background: var(--background);
+  font-family: 'Inter', sans-serif;
+  overflow-x: hidden;
+}
+
+@layer components {
+  .glass-card {
+    @apply bg-opacity-70 bg-gray-900 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl;
+  }
+  
+  .neon-text {
+    text-shadow: 0 0 10px var(--accent-glow), 0 0 20px var(--accent-glow);
+  }
+  
+  .neon-border {
+    @apply border border-[#00d1ff]/30 shadow-[0_0_15px_rgba(0,209,255,0.1)];
+  }
+
+  .sidebar-link {
+    @apply flex items-center gap-3 px-4 py-3 rounded-xl transition-all duration-200 hover:bg-white/5 text-gray-400 hover:text-white;
+  }
+
+  .sidebar-link.active {
+    @apply bg-[#00d1ff]/10 text-[#00d1ff] border-r-2 border-[#00d1ff];
+  }
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}

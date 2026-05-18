@@ -1,0 +1,562 @@
+{
+  "name": "Sentinel CDR \u2014 Minimal Encrypted Session",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "forensic",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*",
+          "rawBody": false
+        }
+      },
+      "id": "node-webhook",
+      "name": "Forensic Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1200,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.body.action }}",
+                    "rightValue": "ingest",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": false
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.body.action }}",
+                    "rightValue": "ai-query",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": false
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.body.action }}",
+                    "rightValue": "destroy",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": false
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": 1
+        }
+      },
+      "id": "node-router",
+      "name": "Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        -860,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ================================================================\n// SENTINEL PARSE ENGINE \u2014 MINIMAL MODE\n// WHAT IS STORED vs NOT STORED:\n//\n//  \u274c NOT stored: raw CDR rows (a_party, b_party, timestamps, addresses)\n//  \u274c NOT stored: IMSI numbers\n//  \u274c NOT stored: tower full addresses\n//  \u274c NOT stored: location URLs\n//\n//  \u2705 STORED (encrypted, minimal):\n//     - tower hit counts + city names only\n//     - contact frequency counts (no names, just numbers + count)\n//     - IMEI \u2192 MSISDN mapping\n//     - geo coordinates only (lat/lng, no address)\n//     - risk index + anomaly count\n//     - call type counts\n//     - date range\n//\n//  \u2705 RETURNED to frontend (in memory only, never stored):\n//     - Full records_json for display during active session\n//     - All derived data for all views\n//\n// The frontend keeps data IN MEMORY (React state) for the session.\n// When user closes/navigates away, data is gone from frontend.\n// Supabase only holds the summary (encrypted).\n// 'destroy' action wipes even that.\n// ================================================================\n\nconst body = $('Forensic Webhook').first().json.body || {};\nconst rawRecords = body.records || [];\n\nif (rawRecords.length === 0) {\n  return [{ json: { success: false, error: 'No records received.' } }];\n}\n\n// Simple XOR-based obfuscation for phone numbers stored in Supabase\n// (real encryption needs a proper key \u2014 see note below)\nconst SESSION_KEY = body.session_key || 'SENTINEL';\nfunction obfuscate(str) {\n  // Hash the string so phone numbers are not stored in plain text\n  // This is one-way \u2014 we only need counts, not the actual numbers\n  let h = 0;\n  for (let i = 0; i < str.length; i++) {\n    h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;\n  }\n  return 'H' + Math.abs(h).toString(36).toUpperCase();\n}\n\n// Month map for '01/Jan/2026' format\nconst MON = {jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11};\nfunction parseTS(dateStr, timeStr) {\n  try {\n    const [d, m, y] = String(dateStr).split('/');\n    const mi = MON[m.toLowerCase().slice(0,3)];\n    const [h,mn,s] = String(timeStr||'00:00:00').split(':').map(Number);\n    if (mi === undefined) return null;\n    return new Date(Date.UTC(+y, mi, +d, h||0, mn||0, s||0));\n  } catch(e) { return null; }\n}\n\nfunction parseGeo(geoStr, locationUrl) {\n  if (geoStr) {\n    const t = String(geoStr).trim().split(/\\s+/).filter(Boolean);\n    if (t.length >= 2) {\n      const la = parseFloat(t[0]), lo = parseFloat(t[1]);\n      if (la>7&&la<38&&lo>66&&lo<99) return { lat:+la.toFixed(5), lng:+lo.toFixed(5), ok:true };\n    }\n  }\n  if (locationUrl) {\n    const m = String(locationUrl).match(/q=([\\d.-]+),([\\d.-]+)/);\n    if (m) {\n      const la = parseFloat(m[1]), lo = parseFloat(m[2]);\n      if (la>7&&la<38&&lo>66&&lo<99) return { lat:+la.toFixed(5), lng:+lo.toFixed(5), ok:true };\n    }\n  }\n  return { lat:0, lng:0, ok:false };\n}\n\n// \u2500\u2500 Parse all rows (kept in memory, returned to frontend) \u2500\u2500\u2500\u2500\nconst scored = rawRecords.map((r, i) => {\n  const tsObj = parseTS(r['Date']||'', r['Time']||'');\n  const ts    = tsObj ? tsObj.toISOString() : new Date().toISOString();\n  const geo   = parseGeo(r['Lat-Long-Azimuth (First CellID)']||'', r['Location']||'');\n  const dur   = parseInt(r['Duration']||0)||0;\n  const ct    = String(r['Call Type']||'CALL').toUpperCase();\n  const h     = tsObj ? tsObj.getUTCHours() : 12;\n\n  let risk = 0;\n  if (h >= 17 || h <= 0) risk += 25;\n  if (dur > 600) risk += 20;\n  if (dur > 300) risk += 10;\n\n  return {\n    s_no:         i+1,\n    a_party:      String(r['CdrNo']||'').trim(),\n    b_party:      String(r['B Party']||'').trim(),\n    timestamp:    ts,\n    duration:     dur,\n    call_type:    ct,\n    tower_id:     String(r['First Cell ID']||'').trim(),\n    tower_address:String(r['First Cell ID Address']||'').trim().replace(/\\t/g,' ').slice(0,120),\n    last_cell_id: String(r['Last Cell ID']||'').trim(),\n    imei:         String(r['IMEI']||'').trim(),\n    imsi:         String(r['IMSI']||'').trim(),\n    roaming:      String(r['Roaming']||'').trim(),\n    b_party_provider: String(r['B Party Provider']||'').trim(),\n    main_city:    String(r['Main City(First CellID)']||'').trim(),\n    sub_city:     String(r['Sub City(First CellID)']||'').trim(),\n    operator:     String(r['Operator']||'').trim(),\n    crime:        String(r['Crime']||'').trim(),\n    latitude:     geo.lat,\n    longitude:    geo.lng,\n    has_geo:      geo.ok,\n    risk_score:   Math.min(risk,100)\n  };\n});\n\n// \u2500\u2500 Risk index \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst risk_index = scored.length\n  ? Math.round(scored.reduce((s,r)=>s+r.risk_score,0)/scored.length) : 0;\n\n// \u2500\u2500 geo_json (coordinates only \u2014 no addresses or names) \u2500\u2500\u2500\u2500\u2500\u2500\nconst geo_json = scored.filter(r=>r.has_geo).map(r=>({\n  lat:r.latitude, lng:r.longitude,\n  tower:r.tower_id, city:r.main_city,\n  a_party:r.a_party, b_party:r.b_party,\n  call_type:r.call_type, ts:r.timestamp\n}));\n\n// \u2500\u2500 timeline \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst timeline_json = [...scored]\n  .sort((a,b)=>new Date(a.timestamp)-new Date(b.timestamp));\n\n// \u2500\u2500 comm_links \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst lm={};\nscored.forEach(r=>{\n  if(r.a_party&&r.b_party){\n    const k=[r.a_party,r.b_party].sort().join('|');\n    lm[k]=(lm[k]||0)+1;\n  }\n});\nconst comm_links=Object.entries(lm)\n  .map(([k,w])=>{const[s,t]=k.split('|');return{source:s,target:t,weight:w};})\n  .sort((a,b)=>b.weight-a.weight);\n\n// \u2500\u2500 tower_analysis \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst tm={};\nscored.forEach(r=>{\n  if(r.tower_id){\n    if(!tm[r.tower_id]) tm[r.tower_id]={hits:0,city:r.main_city,lat:r.latitude,lng:r.longitude,address:r.tower_address};\n    tm[r.tower_id].hits++;\n  }\n});\nconst tower_analysis=Object.entries(tm)\n  .map(([id,v])=>({tower_id:id,...v}))\n  .sort((a,b)=>b.hits-a.hits);\n\n// \u2500\u2500 common_numbers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst nm={};\nscored.forEach(r=>{\n  if(r.b_party){\n    if(!nm[r.b_party]) nm[r.b_party]={count:0,provider:r.b_party_provider};\n    nm[r.b_party].count++;\n  }\n});\nconst common_numbers=Object.entries(nm)\n  .map(([n,v])=>({number:n,contact_count:v.count,provider:v.provider}))\n  .sort((a,b)=>b.contact_count-a.contact_count)\n  .slice(0,30);\n\n// \u2500\u2500 imei_mapping \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst im={};\nscored.forEach(r=>{\n  if(r.imei){\n    if(!im[r.imei]) im[r.imei]={msisdns:new Set(),imsis:new Set()};\n    if(r.a_party) im[r.imei].msisdns.add(r.a_party);\n    if(r.imsi)    im[r.imei].imsis.add(r.imsi);\n  }\n});\nconst imei_mapping=Object.entries(im)\n  .map(([imei,v])=>({imei,msisdns:[...v.msisdns],imsis:[...v.imsis]}));\n\n// \u2500\u2500 anomalies \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst anomalies=scored.filter(r=>r.risk_score>=25);\n\n// \u2500\u2500 call type counts \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nconst ct_counts={};\nscored.forEach(r=>{ct_counts[r.call_type]=(ct_counts[r.call_type]||0)+1;});\n\n// ================================================================\n// MINIMAL STORAGE PAYLOAD \u2014 what goes into Supabase\n// Phone numbers are hashed (one-way), not stored in plain text.\n// No raw records, no IMSI, no full addresses.\n// ================================================================\nconst storage_payload = {\n  // Stats only\n  total_records: scored.length,\n  risk_index,\n  anomaly_count: anomalies.length,\n  geo_point_count: geo_json.length,\n  call_types: ct_counts,\n  date_range: {\n    start: timeline_json[0]?.timestamp || null,\n    end:   timeline_json[timeline_json.length-1]?.timestamp || null\n  },\n  // Tower hits \u2014 city + hit count only (no full address)\n  tower_summary: tower_analysis.slice(0,20).map(t=>({\n    tower_id: t.tower_id,\n    hits: t.hits,\n    city: t.city,\n    lat: t.lat,\n    lng: t.lng\n    // address intentionally omitted\n  })),\n  // Contact frequency \u2014 HASHED numbers, not plain text\n  contact_hashes: common_numbers.slice(0,20).map(n=>({\n    number_hash: obfuscate(n.number),  // one-way hash\n    contact_count: n.contact_count,\n    provider: n.provider\n  })),\n  // IMEI \u2014 keep as-is (device identifier, not personal data)\n  imei_count: imei_mapping.length,\n  imei_list: imei_mapping.map(d=>({\n    imei: d.imei,\n    msisdn_count: d.msisdns.length\n    // actual msisdns omitted from storage\n  })),\n  // Geo coordinates only (no addresses, no party info)\n  geo_sample: geo_json.slice(0,100).map(g=>({lat:g.lat,lng:g.lng,tower:g.tower,city:g.city}))\n};\n\n// \u2500\u2500 AI context (for Sentinel to use during session) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n// This IS stored so AI can answer queries after page refresh,\n// but uses hashed numbers and city-level data only.\nconst ai_context = JSON.stringify({\n  subject_hash: obfuscate(scored[0]?.a_party||''),\n  subject_display: scored[0]?.a_party || '',  // shown in UI, not in storage payload\n  total_records: scored.length,\n  risk_index,\n  anomaly_count: anomalies.length,\n  date_range: storage_payload.date_range,\n  call_types: ct_counts,\n  top_towers: storage_payload.tower_summary,\n  // For AI: use real numbers so it can answer questions meaningfully\n  top_contacts: common_numbers.slice(0,15),\n  imei_devices: imei_mapping,\n  anomaly_sample: anomalies.slice(0,10),\n  records_sample: scored.slice(0,30)\n});\n\nconst investigationId = body.investigation_id\n  || ('INV-'+Math.random().toString(36).slice(2,8).toUpperCase());\n\nreturn [{ json: {\n  success: true,\n  investigation_id: investigationId,\n  case_number: 'CASE-'+investigationId,\n  title: body.title||body.filename||'CDR Analysis',\n  risk_index,\n  total_records: scored.length,\n  anomaly_count: anomalies.length,\n\n  // \u2500\u2500 For Supabase (minimal, hashed) \u2500\u2500\n  storage_payload: JSON.stringify(storage_payload),\n  ai_context,\n\n  // \u2500\u2500 Returned to frontend only (never stored) \u2500\u2500\n  records_json:   scored,\n  geo_json,\n  timeline_json,\n  comm_links,\n  tower_analysis,\n  common_numbers,\n  imei_mapping,\n  anomalies\n}}];"
+      },
+      "id": "node-parse",
+      "name": "Parse & Score CDR Records",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -480,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://symwxamdwoouyzmlfahr.supabase.co/rest/v1/investigations",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN5bXd4YW1kd29vdXl6bWxmYWhyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg4MjU1MTQsImV4cCI6MjA5NDQwMTUxNH0.44sr9wU6j7rYer7REayxsgQqU7n_6tXu_yXpz-Lz288"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN5bXd4YW1kd29vdXl6bWxmYWhyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg4MjU1MTQsImV4cCI6MjA5NDQwMTUxNH0.44sr9wU6j7rYer7REayxsgQqU7n_6tXu_yXpz-Lz288"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "resolution=merge-duplicates,return=minimal"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  case_number:   $json.case_number,\n  title:         $json.title,\n  status:        'active',\n  risk_score:    $json.risk_index,\n  total_records: $json.total_records,\n  ai_context:    $json.ai_context,\n  analysis_json: $json.storage_payload,\n  metadata:      JSON.stringify({ investigation_id: $json.investigation_id, anomaly_count: $json.anomaly_count }),\n  records_json:  '[]',\n  geo_json:      '[]',\n  timeline_json: '[]'\n}) }}",
+        "options": {}
+      },
+      "id": "node-save",
+      "name": "Save Minimal to Supabase",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -120,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({\n  success:          $('Parse & Score CDR Records').first().json.success,\n  investigation_id: $('Parse & Score CDR Records').first().json.investigation_id,\n  total_records:    $('Parse & Score CDR Records').first().json.total_records,\n  risk_index:       $('Parse & Score CDR Records').first().json.risk_index,\n  anomaly_count:    $('Parse & Score CDR Records').first().json.anomaly_count,\n  records_json:     $('Parse & Score CDR Records').first().json.records_json,\n  geo_json:         $('Parse & Score CDR Records').first().json.geo_json,\n  timeline_json:    $('Parse & Score CDR Records').first().json.timeline_json,\n  comm_links:       $('Parse & Score CDR Records').first().json.comm_links,\n  tower_analysis:   $('Parse & Score CDR Records').first().json.tower_analysis,\n  common_numbers:   $('Parse & Score CDR Records').first().json.common_numbers,\n  imei_mapping:     $('Parse & Score CDR Records').first().json.imei_mapping,\n  anomalies:        $('Parse & Score CDR Records').first().json.anomalies\n}) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "*"
+              }
+            ]
+          }
+        }
+      },
+      "id": "node-respond-ingest",
+      "name": "Respond Ingest",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://symwxamdwoouyzmlfahr.supabase.co/rest/v1/investigations?case_number=eq.CASE-' + $json.body.investigation_id + '&select=case_number,title,total_records,risk_score,ai_context,analysis_json,metadata&limit=1' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN5bXd4YW1kd29vdXl6bWxmYWhyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg4MjU1MTQsImV4cCI6MjA5NDQwMTUxNH0.44sr9wU6j7rYer7REayxsgQqU7n_6tXu_yXpz-Lz288"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN5bXd4YW1kd29vdXl6bWxmYWhyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg4MjU1MTQsImV4cCI6MjA5NDQwMTUxNH0.44sr9wU6j7rYer7REayxsgQqU7n_6tXu_yXpz-Lz288"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-fetch",
+      "name": "Fetch Investigation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -480,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.first().json;\nconst row  = Array.isArray(rows) ? rows[0] : rows;\nconst msg  = $('Forensic Webhook').first().json.body?.message || 'Give me a full summary.';\n\nif (!row || !row.case_number) {\n  return [{ json: { error: 'Investigation not found.', user_message: msg, ai_context: {}, tower_analysis:[], common_numbers:[], imei_mapping:[] } }];\n}\n\nfunction safe(v, fb) {\n  if (!v) return fb;\n  if (typeof v === 'object') return v;\n  try { return JSON.parse(v); } catch(e) { return fb; }\n}\n\nconst ai_ctx  = safe(row.ai_context, {});\nconst analysis = safe(row.analysis_json, {});\nconst metadata = safe(row.metadata, {});\n\nreturn [{ json: {\n  user_message:   msg,\n  case_number:    row.case_number,\n  title:          row.title,\n  total_records:  row.total_records,\n  risk_index:     row.risk_score,\n  anomaly_count:  metadata.anomaly_count || 0,\n  ai_context:     ai_ctx,\n  tower_analysis: analysis.tower_summary  || [],\n  common_numbers: ai_ctx.top_contacts     || [],\n  imei_mapping:   ai_ctx.imei_devices     || []\n}}];"
+      },
+      "id": "node-prep-ai",
+      "name": "Prepare AI Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -120,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.user_message }}",
+        "options": {
+          "systemMessage": "=You are SENTINEL, forensic intelligence AI for the Cyber-CDR platform. You analyze Indian telecom CDR data.\n\n--- INVESTIGATION ---\nSubject: {{ $json.ai_context.subject_display }}\nCase: {{ $json.case_number }} | {{ $json.title }}\nRecords: {{ $json.total_records }} | Risk: {{ $json.risk_index }}/100 | Anomalies: {{ $json.anomaly_count }}\nPeriod: {{ $json.ai_context.date_range?.start }} \u2192 {{ $json.ai_context.date_range?.end }}\n\nCall Types: {{ JSON.stringify($json.ai_context.call_types) }}\n\nTop Towers:\n{{ JSON.stringify($json.ai_context.top_towers, null, 2) }}\n\nTop Contacts:\n{{ JSON.stringify($json.ai_context.top_contacts, null, 2) }}\n\nIMEI Devices:\n{{ JSON.stringify($json.ai_context.imei_devices, null, 2) }}\n\nAnomalous Records:\n{{ JSON.stringify($json.ai_context.anomaly_sample, null, 2) }}\n\nSample Records (30):\n{{ JSON.stringify($json.ai_context.records_sample, null, 2) }}\n--- END ---\n\nRULES:\n- Answer only from the data above. Never fabricate.\n- Cite s_no for specific records.\n- Tower queries: tower_id, hits, city.\n- IMEI queries: list MSISDNs and IMSIs.\n- Anomaly queries: explain flag reason.\n- Use **bold headers**.\n- End with: **SENTINEL ASSESSMENT:** [one-line verdict]\n- For summary: cover Subject, Period, Records, Risk, Top Towers, Top Contacts, IMEI, Anomalies."
+        }
+      },
+      "id": "node-agent",
+      "name": "Sentinel AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2.2,
+      "position": [
+        240,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-1.5-pro",
+        "options": {
+          "temperature": 0.1,
+          "maxOutputTokens": 2048
+        }
+      },
+      "id": "node-gemini",
+      "name": "Gemini 1.5 Pro",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        220,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('Forensic Webhook').first().json.body.investigation_id || 'default-session' }}",
+        "contextWindowLength": 20
+      },
+      "id": "node-memory",
+      "name": "Memory",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        420,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, response: $json.output }) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "*"
+              }
+            ]
+          }
+        }
+      },
+      "id": "node-respond-ai",
+      "name": "Respond AI",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        600,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "DELETE",
+        "url": "={{ 'https://symwxamdwoouyzmlfahr.supabase.co/rest/v1/investigations?case_number=eq.CASE-' + $json.body.investigation_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN5bXd4YW1kd29vdXl6bWxmYWhyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg4MjU1MTQsImV4cCI6MjA5NDQwMTUxNH0.44sr9wU6j7rYer7REayxsgQqU7n_6tXu_yXpz-Lz288"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN5bXd4YW1kd29vdXl6bWxmYWhyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg4MjU1MTQsImV4cCI6MjA5NDQwMTUxNH0.44sr9wU6j7rYer7REayxsgQqU7n_6tXu_yXpz-Lz288"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-delete",
+      "name": "Delete from Supabase",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -480,
+        540
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"success\": true, \"message\": \"Investigation data permanently deleted.\"}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "*"
+              }
+            ]
+          }
+        }
+      },
+      "id": "node-respond-destroy",
+      "name": "Respond Destroy",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -120,
+        540
+      ]
+    },
+    {
+      "parameters": {
+        "color": 3,
+        "width": 820,
+        "height": 90,
+        "content": "ROUTE 1 \u2014 INGEST: stores ONLY summary stats + hashed phone numbers. Raw records returned to frontend (memory only) but NEVER saved to DB."
+      },
+      "id": "note1",
+      "name": "Note1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -480,
+        -220
+      ]
+    },
+    {
+      "parameters": {
+        "color": 7,
+        "width": 820,
+        "height": 80,
+        "content": "ROUTE 2 \u2014 AI QUERY: POST { action:'ai-query', investigation_id, message }  \u2192  reads minimal summary from DB  \u2192  Gemini answers"
+      },
+      "id": "note2",
+      "name": "Note2",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -480,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "color": 4,
+        "width": 820,
+        "height": 80,
+        "content": "ROUTE 3 \u2014 DESTROY: POST { action:'destroy', investigation_id }  \u2192  DELETE row from Supabase permanently. Call this on session end / tab close."
+      },
+      "id": "note3",
+      "name": "Note3",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "color": 6,
+        "width": 340,
+        "height": 360,
+        "content": "WHAT IS STORED IN SUPABASE:\n\u2705 Tower IDs + hit counts + city names\n\u2705 Contact frequency counts\n\u2705 HASHED phone numbers (one-way)\n\u2705 IMEI counts\n\u2705 Geo coordinates (lat/lng only)\n\u2705 Date range + risk index\n\nWHAT IS NEVER STORED:\n\u274c Raw CDR rows\n\u274c Plain-text phone numbers\n\u274c Full tower addresses\n\u274c IMSI numbers\n\u274c Location URLs\n\u274c The xlsx file itself\n\nSession end \u2192 call destroy \u2192 DB row gone"
+      },
+      "id": "note4",
+      "name": "Note4",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1600,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Forensic Webhook": {
+      "main": [
+        [
+          {
+            "node": "Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Router": {
+      "main": [
+        [
+          {
+            "node": "Parse & Score CDR Records",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fetch Investigation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Delete from Supabase",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Score CDR Records": {
+      "main": [
+        [
+          {
+            "node": "Save Minimal to Supabase",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Minimal to Supabase": {
+      "main": [
+        [
+          {
+            "node": "Respond Ingest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Investigation": {
+      "main": [
+        [
+          {
+            "node": "Prepare AI Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare AI Context": {
+      "main": [
+        [
+          {
+            "node": "Sentinel AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini 1.5 Pro": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Sentinel AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "Sentinel AI Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sentinel AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Respond AI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete from Supabase": {
+      "main": [
+        [
+          {
+            "node": "Respond Destroy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": false,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  }
+}

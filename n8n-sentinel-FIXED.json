@@ -1,0 +1,263 @@
+{
+  "name": "Sentinel Forensic Pipeline - FIXED",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "forensic",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true,
+          "allowedOrigins": "*"
+        }
+      },
+      "id": "webhook-main",
+      "name": "Forensic Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-600, 0]
+    },
+    {
+      "parameters": {
+        "dataType": "string",
+        "value1": "={{ $json.body.action ?? $json.query?.action ?? 'ingest' }}",
+        "rules": {
+          "rules": [
+            { "value2": "ingest", "output": 0 },
+            { "value2": "ai-query", "output": 1 }
+          ]
+        },
+        "fallbackOutput": 1
+      },
+      "id": "router",
+      "name": "Route Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [-360, 0]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// SENTINEL FORENSIC PARSE ENGINE v3 — FIXED\n// Handles: multipart file upload OR JSON records body\n// Fixes: UUID generation, lat/long 3-token parsing, IMEI mapping,\n//        comm_links, tower_analysis, common_numbers, anomalies\n// ============================================================\n\nconst body = $('Forensic Webhook').first().json.body || {};\n\nfunction makeShortId() {\n  return Math.random().toString(36).substring(2, 9).toUpperCase();\n}\nfunction makeUUID() {\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {\n    const r = Math.random() * 16 | 0;\n    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);\n  });\n}\n\nconst investigationId = body.investigation_id || ('INV-' + makeShortId());\nconst investigationUUID = makeUUID(); // always a real UUID for Supabase PK\n\n// ── Collect raw rows ─────────────────────────────────────────\nlet rawRecords = [];\n\n// Path 1: JSON records array in body\nif (body.records && Array.isArray(body.records) && body.records.length > 0) {\n  rawRecords = body.records;\n}\n// Path 2: rows parsed upstream by a spreadsheet node (passed as items)\nelse {\n  const items = $input.all();\n  if (items.length > 1 || (items.length === 1 && items[0].json && Object.keys(items[0].json).length > 5)) {\n    rawRecords = items.map(i => i.json);\n  }\n}\n\nif (rawRecords.length === 0) {\n  // Return a structured empty response so frontend doesn't crash\n  return [{\n    json: {\n      success: false,\n      error: 'No records found. Ensure the Excel/CSV file was uploaded correctly and contains data rows.',\n      investigation_id: investigationId,\n      investigation_uuid: investigationUUID,\n      records_json: [],\n      timeline_json: [],\n      geo_json: [],\n      comm_links: [],\n      tower_analysis: [],\n      common_numbers: [],\n      imei_mapping: [],\n      anomalies: [],\n      ai_context: '{}',\n      risk_index: 0,\n      total_records: 0,\n      anomaly_count: 0\n    }\n  }];\n}\n\n// ── Parse & Score ─────────────────────────────────────────────\nconst scored = rawRecords.map((rec, idx) => {\n  let risk = 0;\n\n  // Timestamp\n  const dateStr = String(rec.Date || rec.date || rec.timestamp || rec['Call Date'] || '');\n  const timeStr = String(rec.Time || rec.time || rec['Call Time'] || '');\n  let ts = new Date().toISOString();\n  if (dateStr && dateStr !== 'undefined') {\n    try {\n      ts = new Date(timeStr ? `${dateStr} ${timeStr}` : dateStr).toISOString();\n      if (isNaN(new Date(ts).getTime())) ts = new Date().toISOString();\n    } catch(e) { ts = new Date().toISOString(); }\n  }\n  const hour = new Date(ts).getHours();\n  if (hour >= 0 && hour <= 5) risk += 20;\n\n  // Duration\n  const duration = parseInt(rec.Duration || rec.duration || rec['Call Duration'] || 0) || 0;\n  if (duration > 300) risk += 15;\n  if (duration > 600) risk += 10;\n\n  // Call type\n  const callType = String(rec['Call Type'] || rec.call_type || rec.Type || 'CALL').toUpperCase();\n\n  // ── Lat/Long parsing — handles 3-token format \"lat long azimuth\" ──\n  let latitude = 0;\n  let longitude = 0;\n\n  if (rec.Latitude && rec.Longitude) {\n    latitude = parseFloat(rec.Latitude) || 0;\n    longitude = parseFloat(rec.Longitude) || 0;\n  } else {\n    // Try multiple possible column names for Indian CDR formats\n    const geoRaw = String(\n      rec['Lat-Long-Azimuth (First CellID)'] ||\n      rec['Lat Long Azimuth (First CellID)'] ||\n      rec['LatLongAzimuth'] ||\n      rec['Lat-Long'] ||\n      rec['Location'] ||\n      rec['lat_long'] ||\n      ''\n    ).trim();\n\n    if (geoRaw) {\n      // Split on whitespace or comma\n      const tokens = geoRaw.split(/[\\s,]+/).filter(t => t.length > 0);\n      if (tokens.length >= 2) {\n        const lat = parseFloat(tokens[0]);\n        const lng = parseFloat(tokens[1]);\n        // Sanity check: valid India coordinates roughly 8–37 lat, 68–97 long\n        if (!isNaN(lat) && !isNaN(lng) && lat > 5 && lat < 40 && lng > 60 && lng < 100) {\n          latitude = lat;\n          longitude = lng;\n        }\n      }\n    }\n  }\n\n  // IMEI\n  const imei = String(rec.IMEI || rec.imei || rec['Device IMEI'] || '').trim();\n\n  // A-party / B-party\n  const aParty = String(rec.CdrNo || rec.a_party || rec['A Party'] || rec['A-Party'] || rec.Caller || '').trim();\n  const bParty = String(rec['B Party'] || rec.b_party || rec['B-Party'] || rec.Receiver || rec.Called || '').trim();\n\n  // Tower\n  const towerId = String(rec['First Cell ID'] || rec['Cell ID'] || rec.tower_id || rec['CellID'] || rec['Cell Id'] || '').trim();\n  const towerAddress = String(rec['First Cell ID Address'] || rec['Tower Address'] || rec['Cell Address'] || '').trim();\n\n  return {\n    s_no: idx + 1,\n    a_party: aParty,\n    b_party: bParty,\n    timestamp: ts,\n    duration,\n    tower_id: towerId,\n    tower_address: towerAddress,\n    latitude,\n    longitude,\n    imei,\n    call_type: callType,\n    risk_score: Math.min(risk, 100)\n  };\n});\n\n// ── Derived datasets ─────────────────────────────────────────\nconst totalRisk = scored.length > 0\n  ? Math.round(scored.reduce((a, b) => a + b.risk_score, 0) / scored.length)\n  : 0;\n\n// geo_json: only records with valid coordinates\nconst geo_json = scored.filter(r => r.latitude !== 0 && r.longitude !== 0).map(r => ({\n  lat: r.latitude,\n  lng: r.longitude,\n  tower: r.tower_id,\n  address: r.tower_address,\n  a_party: r.a_party,\n  ts: r.timestamp\n}));\n\n// timeline_json\nconst timeline_json = [...scored].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));\n\n// comm_links\nconst linkMap = {};\nscored.forEach(r => {\n  if (r.a_party && r.b_party) {\n    const key = [r.a_party, r.b_party].sort().join('|||');\n    linkMap[key] = (linkMap[key] || 0) + 1;\n  }\n});\nconst comm_links = Object.entries(linkMap).map(([k, count]) => {\n  const [src, tgt] = k.split('|||');\n  return { source: src, target: tgt, weight: count };\n});\n\n// tower_analysis\nconst towerMap = {};\nscored.forEach(r => {\n  if (r.tower_id) {\n    if (!towerMap[r.tower_id]) towerMap[r.tower_id] = { hits: 0, address: r.tower_address };\n    towerMap[r.tower_id].hits++;\n  }\n});\nconst tower_analysis = Object.entries(towerMap)\n  .map(([id, v]) => ({ tower_id: id, hits: v.hits, address: v.address }))\n  .sort((a, b) => b.hits - a.hits);\n\n// common_numbers\nconst numMap = {};\nscored.forEach(r => { if (r.b_party) numMap[r.b_party] = (numMap[r.b_party] || 0) + 1; });\nconst common_numbers = Object.entries(numMap)\n  .map(([num, count]) => ({ number: num, contact_count: count }))\n  .sort((a, b) => b.contact_count - a.contact_count)\n  .slice(0, 30);\n\n// imei_mapping\nconst imeiMap = {};\nscored.forEach(r => {\n  if (r.imei) {\n    if (!imeiMap[r.imei]) imeiMap[r.imei] = new Set();\n    if (r.a_party) imeiMap[r.imei].add(r.a_party);\n  }\n});\nconst imei_mapping = Object.entries(imeiMap).map(([imei, nums]) => ({\n  imei,\n  msisdns: [...nums],\n  msisdn_count: nums.size\n}));\n\n// anomalies\nconst anomalies = scored.filter(r => r.risk_score > 10);\n\n// ai_context — compact summary for Gemini\nconst ai_context = JSON.stringify({\n  total_records: scored.length,\n  risk_index: totalRisk,\n  anomaly_count: anomalies.length,\n  geo_points: geo_json.length,\n  top_towers: tower_analysis.slice(0, 8),\n  top_contacts: common_numbers.slice(0, 10),\n  imei_count: imei_mapping.length,\n  imei_summary: imei_mapping.slice(0, 5),\n  date_range: {\n    start: timeline_json[0]?.timestamp || null,\n    end: timeline_json[timeline_json.length - 1]?.timestamp || null\n  },\n  sample_records: scored.slice(0, 20)\n});\n\nreturn [{\n  json: {\n    success: true,\n    investigation_id: investigationId,\n    investigation_uuid: investigationUUID,\n    case_number: 'CASE-' + investigationId,\n    title: body.title || body.filename || 'CDR Forensic Analysis',\n    records_json: scored,\n    timeline_json,\n    geo_json,\n    comm_links,\n    tower_analysis,\n    common_numbers,\n    imei_mapping,\n    anomalies,\n    ai_context,\n    risk_index: totalRisk,\n    total_records: scored.length,\n    anomaly_count: anomalies.length\n  }\n}];"
+      },
+      "id": "parse-engine",
+      "name": "Parse & Score CDR Records",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-100, -200]
+    },
+
+    {
+      "parameters": {
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/investigations",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "resolution=merge-duplicates,return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  id: $json.investigation_uuid,\n  case_number: $json.case_number,\n  title: $json.title,\n  status: 'active',\n  risk_score: $json.risk_index,\n  total_records: $json.total_records,\n  ai_context: $json.ai_context,\n  records_json: JSON.stringify($json.records_json),\n  timeline_json: JSON.stringify($json.timeline_json),\n  geo_json: JSON.stringify($json.geo_json),\n  analysis_json: JSON.stringify({\n    comm_links: $json.comm_links,\n    tower_analysis: $json.tower_analysis,\n    common_numbers: $json.common_numbers,\n    imei_mapping: $json.imei_mapping\n  }),\n  metadata: JSON.stringify({\n    investigation_id: $json.investigation_id,\n    anomalies: $json.anomalies,\n    anomaly_count: $json.anomaly_count\n  }),\n  updated_at: new Date().toISOString()\n}) }}",
+        "options": {}
+      },
+      "id": "save-supabase",
+      "name": "Save to Supabase (HTTP)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [180, -200]
+    },
+
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({\n  success: $('Parse & Score CDR Records').first().json.success,\n  investigation_id: $('Parse & Score CDR Records').first().json.investigation_id,\n  investigation_uuid: $('Parse & Score CDR Records').first().json.investigation_uuid,\n  total_records: $('Parse & Score CDR Records').first().json.total_records,\n  risk_index: $('Parse & Score CDR Records').first().json.risk_index,\n  anomaly_count: $('Parse & Score CDR Records').first().json.anomaly_count,\n  records_json: $('Parse & Score CDR Records').first().json.records_json,\n  timeline_json: $('Parse & Score CDR Records').first().json.timeline_json,\n  geo_json: $('Parse & Score CDR Records').first().json.geo_json,\n  comm_links: $('Parse & Score CDR Records').first().json.comm_links,\n  tower_analysis: $('Parse & Score CDR Records').first().json.tower_analysis,\n  common_numbers: $('Parse & Score CDR Records').first().json.common_numbers,\n  imei_mapping: $('Parse & Score CDR Records').first().json.imei_mapping,\n  anomalies: $('Parse & Score CDR Records').first().json.anomalies\n}) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              { "name": "Content-Type", "value": "application/json" },
+              { "name": "Access-Control-Allow-Origin", "value": "*" },
+              { "name": "Access-Control-Allow-Headers", "value": "Content-Type" }
+            ]
+          }
+        }
+      },
+      "id": "respond-ingest",
+      "name": "Respond Ingest",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [460, -200]
+    },
+
+    {
+      "parameters": {
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/investigations?case_number=eq.CASE-{{ $json.body.investigation_id }}&select=*",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Accept", "value": "application/json" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "fetch-investigation",
+      "name": "Fetch Investigation from Supabase",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-100, 200]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Unwrap the Supabase array response and parse all JSON fields\nconst rows = $input.first().json;\nconst row = Array.isArray(rows) ? rows[0] : rows;\n\nif (!row) {\n  return [{ json: { error: 'Investigation not found in database', row: null } }];\n}\n\n// Parse all stringified JSON fields back to objects\nfunction safeJSON(val) {\n  if (!val) return [];\n  if (typeof val === 'object') return val;\n  try { return JSON.parse(val); } catch(e) { return []; }\n}\n\nconst records_json = safeJSON(row.records_json);\nconst timeline_json = safeJSON(row.timeline_json);\nconst geo_json = safeJSON(row.geo_json);\nconst analysis = safeJSON(row.analysis_json);\nconst metadata = safeJSON(row.metadata);\nlet ai_context = {};\ntry { ai_context = JSON.parse(row.ai_context || '{}'); } catch(e) {}\n\nreturn [{\n  json: {\n    investigation_id: metadata.investigation_id || row.case_number,\n    case_number: row.case_number,\n    title: row.title,\n    total_records: row.total_records,\n    risk_index: row.risk_score,\n    anomaly_count: metadata.anomaly_count || 0,\n    records_json,\n    timeline_json,\n    geo_json,\n    comm_links: analysis.comm_links || [],\n    tower_analysis: analysis.tower_analysis || [],\n    common_numbers: analysis.common_numbers || [],\n    imei_mapping: analysis.imei_mapping || [],\n    anomalies: metadata.anomalies || [],\n    ai_context,\n    // Pass the user's question from the original request\n    user_message: $('Forensic Webhook').first().json.body.message || 'Provide a summary of this investigation.'\n  }\n}];"
+      },
+      "id": "prepare-ai-context",
+      "name": "Prepare AI Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [180, 200]
+    },
+
+    {
+      "parameters": {
+        "options": {
+          "systemMessage": "=You are SENTINEL, an elite forensic intelligence AI within the Cyber-CDR Intelligence Fusion Center. You are analytical, precise and speak like a senior intelligence analyst.\n\n<investigation_data>\nInvestigation ID: {{ $json.investigation_id }}\nCase: {{ $json.case_number }}\nTitle: {{ $json.title }}\nTotal CDR Records: {{ $json.total_records }}\nRisk Index: {{ $json.risk_index }}/100\nAnomalies Detected: {{ $json.anomaly_count }}\nGeo Points Mapped: {{ $json.geo_json.length }}\n\nAI Intelligence Summary:\n{{ JSON.stringify($json.ai_context, null, 2) }}\n\nTop Tower Activity:\n{{ JSON.stringify($json.tower_analysis.slice(0, 10), null, 2) }}\n\nIMEI Device Mapping:\n{{ JSON.stringify($json.imei_mapping, null, 2) }}\n\nMost Contacted Numbers:\n{{ JSON.stringify($json.common_numbers.slice(0, 15), null, 2) }}\n\nCommunication Links (Relationship Graph):\n{{ JSON.stringify($json.comm_links.slice(0, 30), null, 2) }}\n\nAnomalous Records:\n{{ JSON.stringify($json.anomalies.slice(0, 20), null, 2) }}\n\nSample CDR Records (first 50):\n{{ JSON.stringify($json.records_json.slice(0, 50), null, 2) }}\n</investigation_data>\n\n<rules>\n- Answer ONLY using the data above. Never fabricate records.\n- Reference s_no when citing specific records.\n- For tower queries: list tower_id, hit count, address.\n- For IMEI queries: list which MSISDNs are linked to each device.\n- For anomaly queries: explain WHY (night call, long duration, etc).\n- Format clearly with **bold headers**.\n- End every response with: **SENTINEL ASSESSMENT:** [one-line risk summary]\n- If data is insufficient: say 'SENTINEL: Insufficient data for this query.'\n</rules>"
+        }
+      },
+      "id": "sentinel-agent",
+      "name": "Sentinel AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2.2,
+      "position": [460, 200]
+    },
+
+    {
+      "parameters": {
+        "modelName": "models/gemini-1.5-pro",
+        "options": {
+          "temperature": 0.1,
+          "maxOutputTokens": 3000
+        }
+      },
+      "id": "gemini-model",
+      "name": "Gemini 1.5 Pro",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [360, 400]
+    },
+
+    {
+      "parameters": {
+        "contextWindowLength": 15
+      },
+      "id": "memory",
+      "name": "Sentinel Memory",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [560, 400]
+    },
+
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, response: $json.output }) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              { "name": "Content-Type", "value": "application/json" },
+              { "name": "Access-Control-Allow-Origin", "value": "*" }
+            ]
+          }
+        }
+      },
+      "id": "respond-ai",
+      "name": "Respond AI",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [720, 200]
+    },
+
+    {
+      "parameters": {
+        "color": 3,
+        "width": 520,
+        "height": 120,
+        "content": "## ✅ ROUTE 1 — INGEST\nReceives CDR file → Parses ALL fields (lat/long/IMEI/towers) → Saves to Supabase via HTTP (bypasses n8n Supabase node UUID issues) → Returns FULL structured data back to frontend"
+      },
+      "id": "note-ingest",
+      "name": "Note Ingest",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-120, -340]
+    },
+    {
+      "parameters": {
+        "color": 7,
+        "width": 520,
+        "height": 120,
+        "content": "## 🤖 ROUTE 2 — AI QUERY\nFetches investigation from Supabase via HTTP (case_number lookup, avoids UUID mismatch) → Parses all JSON fields → Injects full dataset into Sentinel system prompt → Gemini 1.5 Pro answers"
+      },
+      "id": "note-ai",
+      "name": "Note AI",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-120, 60]
+    },
+    {
+      "parameters": {
+        "color": 6,
+        "width": 700,
+        "height": 200,
+        "content": "## ⚙️ REQUIRED: n8n Environment Variables\nSet these in n8n → Settings → Environment Variables (or in your .env / docker-compose):\n\n- `SUPABASE_URL` = https://xxxx.supabase.co\n- `SUPABASE_SERVICE_KEY` = your service_role key (NOT anon key — service key bypasses RLS)\n- `GEMINI_API_KEY` = your Gemini API key (connect to the Gemini Model node credential)\n\n⚠️ Use SERVICE_ROLE key so n8n can write without auth restrictions"
+      },
+      "id": "note-env",
+      "name": "Note Env Vars",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-620, 300]
+    }
+  ],
+
+  "connections": {
+    "Forensic Webhook": {
+      "main": [[{ "node": "Route Action", "type": "main", "index": 0 }]]
+    },
+    "Route Action": {
+      "main": [
+        [{ "node": "Parse & Score CDR Records", "type": "main", "index": 0 }],
+        [{ "node": "Fetch Investigation from Supabase", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse & Score CDR Records": {
+      "main": [[{ "node": "Save to Supabase (HTTP)", "type": "main", "index": 0 }]]
+    },
+    "Save to Supabase (HTTP)": {
+      "main": [[{ "node": "Respond Ingest", "type": "main", "index": 0 }]]
+    },
+    "Fetch Investigation from Supabase": {
+      "main": [[{ "node": "Prepare AI Context", "type": "main", "index": 0 }]]
+    },
+    "Prepare AI Context": {
+      "main": [[{ "node": "Sentinel AI Agent", "type": "main", "index": 0 }]]
+    },
+    "Gemini 1.5 Pro": {
+      "ai_languageModel": [[{ "node": "Sentinel AI Agent", "type": "ai_languageModel", "index": 0 }]]
+    },
+    "Sentinel Memory": {
+      "ai_memory": [[{ "node": "Sentinel AI Agent", "type": "ai_memory", "index": 0 }]]
+    },
+    "Sentinel AI Agent": {
+      "main": [[{ "node": "Respond AI", "type": "main", "index": 0 }]]
+    }
+  },
+
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
